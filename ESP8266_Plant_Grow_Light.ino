@@ -40,22 +40,23 @@
  *  {dim2} -> Sets dim level 2
  *  {dim3} -> Sets dim level 3
  *  [toff] -> Sets timer to off
- *  [t3hr] -> Sets timer to 3 hrs
- *  [t6hr] -> Sets timer to 6 hrs
- *  [t12hr] -> Sets timer to 12 hrs
  * 
  * Hardware Theory of Operation:
  * ---
  * Soldered onto PCB ~
+ * 
  *  Blue Wire = Pad S2 = Dimming Button (BTN 2)
  *      - Level shifter to ESP for input
  *      - ESP to MOFET for output
+ * 
  *  White Wire = Pad S3 = Power Button (BTN 1)
  *      - Level shifter to ESP for input
  *      - ESP to MOFET for output
+ * 
  *  Green Wire = Pad S4 = Timing Button (BTN 3)
  *      - Level shifter to ESP for input
  *      - ESP to MOFET for output
+ * 
  *  Yellow Wires (2) = Channel PWM lines = Not Connected
  * 
  * Timer displays state via red and blue LEDs
@@ -151,7 +152,7 @@
 #define FALLBACK_AP_NAME                        "AP-ESP8266-Plant-Grow-Light"
 
 #define __NUM_POWER_STATES__                    (4)
-#define __NUM_DIMMER_STATES__                   (4)
+#define __NUM_DIMMER_STATES__                   (5)
 #define __NUM_TIMER_STATES__                    (4)
 
 //==============================================================================
@@ -165,11 +166,12 @@
 
 #define writeStatusLED(state)   (digitalWrite(STATUS_LED_PIN, (bool)(state)))
 
-#define _pulseBtn(pin) {
-    Serial.println("Pulse " #pin);
-    digitalWrite(pin, HIGH);
-    delay(PULSE_TIME);
-    digitalWrite(pin, LOW);
+#define _pulseBtn(pin) {                                                       \
+    Serial.println("Pulse " #pin);                                             \
+    digitalWrite(pin, HIGH);                                                   \
+    delay(PULSE_TIME);                                                         \
+    digitalWrite(pin, LOW);                                                    \
+    delay(1);                                                                  \
 }
 
 #define pulsePowerBtn()         (_pulseBtn(CTRL_PWR_PIN))
@@ -180,9 +182,43 @@
 //  Enumerated Constants
 //==============================================================================
 
+typedef enum _led_channel {
+    LED_OFF,
+    LED_ALL,
+    LED_CHA,
+    LED_CHB
+} led_channel_t;
+
+typedef enum _led_dimmer {
+    LED_DIM_0,
+    LED_DIM_1,
+    LED_DIM_2,
+    LED_DIM_3,
+    LED_DIM_4
+} led_dimmer_t;
+
+typedef enum _led_timer {
+    LED_TIMER_OFF,
+    LED_TIMER_3HR,
+    LED_TIMER_6HR,
+    LED_TIMER_12HR
+} led_timer_t;
+
 //==============================================================================
 //  Data Structure Declaration
 //==============================================================================
+
+typedef struct _led_state {
+    led_channel_t ch;
+    led_dimmer_t dim;
+    led_timer_t tim;
+} led_state_t;
+
+typedef struct _soft_timer {
+    String timestamp;
+    int hours;
+    unsigned long _targetTime; // use getEpochTime()
+} soft_timer_t;
 
 //==============================================================================
 //  Declared Constants
@@ -210,14 +246,22 @@ static char _rxBuffer[50];
 static int _rxBufferIdx = 0;
 static bool _prevBtnState = false;
 static bool _flag_reset = false;
+static bool _hasActiveRPC = false;
+static bool _softTimerActive = false;
+static char _activeRPCUUID[50];
+static led_state_t _currentState, _targetState;
+static soft_timer_t _softTimer;
 
 //==============================================================================
 //  Private Function Prototypes
 //==============================================================================
 
-static unsigned long _blinkDurationByState(/*TODO*/);
+static unsigned long _blinkDurationByState();
 static void _pushStateSetup(polip_device_t* dev, JsonDocument& doc);
 static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc);
+static void _pollRPCResponse(polip_device_t* dev, JsonDocument& doc);
+static void _pushRPCSetup(polip_device_t* dev, JsonDocument& doc);
+static void _pushRPCResponse(polip_device_t* dev, JsonDocument& doc);
 static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source);
 
 //==============================================================================
@@ -255,15 +299,27 @@ void setup() {
     _polipDevice.skipTagCheck = false;
 
     _polipWorkflow.device = &_polipDevice;
+    _polipWorkflow.params.pollRPC = false;
     _polipWorkflow.hooks.pushStateSetupCb = _pushStateSetup;
     _polipWorkflow.hooks.pollStateRespCb = _pollStateResponse;
+    _polipWorkflow.hooks.pollRPCRespCb = _pollRPCResponse;
     _polipWorkflow.hooks.workflowErrorCb = _errorHandler;
+    _polipWorkflow.hooks.pushRPCSetupCb = _pushRPCSetup;
+    _polipWorkflow.hooks.pushRPCRespCb = _pushRPCResponse;
 
     unsigned long currentTime = millis();
     polip_workflow_initialize(&_polipWorkflow, currentTime);
     _cooldownTime = _blinkTime = _resetTime = currentTime;
     _prevBtnState = readResetBtnState();
     _flag_reset = false;
+
+    _currentState.ch = LED_OFF;
+    _currentState.dim = LED_DIM_4;
+    _currentState.tim = LED_TIMER_OFF;
+
+    _targetState.ch = LED_OFF;
+    _targetState.dim = LED_DIM_4;
+    _targetState.tim = LED_TIMER_OFF;
 }
 
 void loop() {
@@ -273,11 +329,15 @@ void loop() {
     // Refresh time
     _timeClient.update();
 
-    // Acknowledge button press state changes
-    //TODO
+    // Monitor soft timer
+     if (_softTimerActive && _timeClient.getEpochTime() >= _softTimer._targetTime) {
+        _targetState.ch = LED_OFF;
+        _softTimerActive = false;
+        POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+    }
 
     // Update Polip Server
-    polip_workflow_periodic_update(&_polipWorkflow, _doc, _timeClient.getFormattedTime().c_str(), currentTime);
+    polip_workflow_periodic_update(&_polipWorkflow, _doc, _timeClient.getFormattedDate().c_str(), currentTime);
 
     // Serial debugging interface provides full state control
     while (Serial.available() > 0) {
@@ -300,35 +360,44 @@ void loop() {
                 Serial.println(F("Debug Reset Requested"));
                 _flag_reset = true;
             } else if (str == "power?") { 
-                
+                Serial.println(_currentState.ch);
             } else if (str == "dim?") { 
-                
+                Serial.println(_currentState.dim);
             } else if (str == "timer?") { 
-                
+                Serial.println(_targetState.tim);
+                Serial.println(_softTimerActive);
+                Serial.println(_softTimer.timestamp);
+                Serial.println(_softTimer.hours);
             } else if (str == "pon") { 
-                
+                _targetState.ch = LED_ALL;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
             } else if (str == "poff") { 
-                
+                _targetState.ch = LED_OFF;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
             } else if (str == "pcha") { 
-                
+                _targetState.ch = LED_CHA;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
             } else if (str == "pchb") { 
-                
+                _targetState.ch = LED_CHB;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
             } else if (str == "dim0") { 
-                
+                _targetState.dim = LED_DIM_0;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
             } else if (str == "dim1") { 
-                
+                _targetState.dim = LED_DIM_1;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
             } else if (str == "dim2") { 
-                
+                _targetState.dim = LED_DIM_2;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
             } else if (str == "dim3") { 
-                
+                _targetState.dim = LED_DIM_3;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+            } else if (str == "dim4") { 
+                _targetState.dim = LED_DIM_4;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
             } else if (str == "toff") { 
-                
-            } else if (str == "t3hr") { 
-                
-            } else if (str == "t6hr") { 
-                
-            } else if (str == "t12hr") { 
-                
+                _targetState.tim = LED_TIMER_OFF;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
             } else if (str == "error?") {
                 if (POLIP_WORKFLOW_IN_ERROR(&_polipWorkflow)) {
                     Serial.println(F("Error in PolipLib: "));
@@ -367,7 +436,20 @@ void loop() {
     }
 
     // Handle our queued pulses. This will block for one pulse at a time!
-    //TODO
+    if ((currentTime - _cooldownTime) > COOLDOWN_THRESHOLD) {
+        _cooldownTime = currentTime;
+
+        if (_currentState.ch != _targetState.ch) {
+            _currentState.ch = (led_channel_t)(((int)_currentState.ch + 1) % __NUM_POWER_STATES__);
+            pulsePowerBtn();
+        } else if (_currentState.tim != _targetState.tim && _currentState.ch != LED_OFF) {
+            _currentState.tim = (led_timer_t)(((int)_currentState.tim + 1) % __NUM_TIMER_STATES__);
+            pulseTimerBtn();
+        } else if (_currentState.dim != _targetState.dim && _currentState.ch != LED_OFF) {
+            _currentState.dim = (led_dimmer_t)(((int)_currentState.dim + 1) % __NUM_DIMMER_STATES__);
+            pulseDimmerBtn();
+        }
+    }
 
     // Blink the LED at a certain rate dependent on state of purifier
     //  Useful for debugging
@@ -384,29 +466,102 @@ void loop() {
 //  Private Function Implementation
 //==============================================================================
 
-static unsigned long _blinkDurationByState(/*TODO*/) {
-    return 0; //TODO
+static unsigned long _blinkDurationByState() {
+    if (_currentState.ch == LED_OFF) {
+        return 2000L; // Long pulse = off
+    } else if (_currentState.tim != LED_TIMER_OFF) {
+        return 100L; // Very fast = error; timer should not be set
+    } else {
+        return 500L + 100L * _currentState.dim;
+    }
 }
 
 static void _pushStateSetup(polip_device_t* dev, JsonDocument& doc) {
     JsonObject stateObj = doc.createNestedObject("state");
-    stateObj["power"] = "off";
-    stateObj["intensity"] = 0;
-    stateObj["channels"] = "all";
+    stateObj["power"] = (_targetState.ch == LED_OFF) ? "off" : "on";
+    stateObj["intensity"] = _targetState.dim;
 
-    JsonObject timer = stateObj.createNestedObject("state");
-    timer["duration"] = "off";
-    timer["timestamp"] = "";
-    //TODO
+    if (_targetState.ch == LED_OFF || _targetState.ch == LED_ALL) {
+        stateObj["channels"] = "all";
+    } else if (_targetState.ch == LED_CHA) {
+        stateObj["channels"] = "a";
+    } else if (_targetState.ch == LED_CHB) {
+        stateObj["channels"] = "b";
+    }
+    
+    if (_softTimerActive) {
+        JsonObject timer = stateObj.createNestedObject("state");
+        timer["timestamp"] = _softTimer.timestamp;
+        timer["duration"] = _softTimer.hours;
+    } else {
+        stateObj["timer"] = nullptr;
+    }
 }
 
 static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc) {
     JsonObject stateObj = doc["state"];
-    const char* power = stateObj["power"];
+    String power = stateObj["power"];
     int intensity = stateObj["intensity"];
-    const char* channels = stateObj["channels"];
-    const char* timer = stateObj["timer"];
-    //TODO
+    String channels = stateObj["channels"];
+    
+    if (power == "off") {
+        _targetState.ch = LED_OFF;
+    } else if (power == "on") {
+        if (channels == "all") {
+            _targetState.ch = LED_ALL;
+        } else if (channels == "a") {
+            _targetState.ch = LED_CHA;
+        } else if (channels == "b") {
+            _targetState.ch = LED_CHB;
+        }
+
+        if (intensity >= 0 && intensity < __NUM_DIMMER_STATES__) {
+            _targetState.dim = (led_dimmer_t)intensity;
+        }
+    }
+    
+    // Note ignore timer (must be set via RPC)
+}
+
+static void _pollRPCResponse(polip_device_t* dev, JsonDocument& doc) {
+    if (!_hasActiveRPC) { // Only accept RPC if not already working on one
+        JsonObject rpcObj = doc["rpc"];
+        String uuid = rpcObj["uuid"]; 
+        String type = rpcObj["type"];
+
+        if (type == "timer") {
+            //parameters parse
+            bool paramsParsedSuccessfully = false;
+            JsonArray array = rpcObj["parameters"].as<JsonArray>();
+            for(JsonObject param : array) {
+                if (param.containsKey("duration")) {
+                    _softTimer.timestamp = _timeClient.getFormattedDate();
+                    _softTimer.hours = param["duration"];
+                    _softTimer._targetTime = 60 * 60 * _softTimer.hours + _timeClient.getEpochTime();
+                    paramsParsedSuccessfully = true;
+                }
+            }
+
+            if (paramsParsedSuccessfully) {
+                _hasActiveRPC = true;
+                strcpy(_activeRPCUUID, uuid.c_str());
+                POLIP_WORKFLOW_RPC_FINISHED(&_polipWorkflow);
+            } else {
+                Serial.println("Failed to parse soft timer RPC");
+            }
+        }
+    }
+}
+
+static void _pushRPCSetup(polip_device_t* dev, JsonDocument& doc) {
+    JsonObject rpcObj = doc.createNestedObject("rpc");
+    rpcObj["uuid"] = _activeRPCUUID;
+    rpcObj["result"] = "OK";
+    
+}
+
+static void _pushRPCResponse(polip_device_t* dev, JsonDocument& doc) {
+    _hasActiveRPC = false;
 }
 
 static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source) { 
