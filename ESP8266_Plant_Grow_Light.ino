@@ -40,6 +40,7 @@
  *  {dim2} -> Sets dim level 2
  *  {dim3} -> Sets dim level 3
  *  [toff] -> Sets timer to off
+ *  [home] -> Request rehoming LEDcontroller to known state
  * 
  * Hardware Theory of Operation:
  * ---
@@ -57,7 +58,9 @@
  *      - Level shifter to ESP for input
  *      - ESP to MOFET for output
  * 
- *  Yellow Wires (2) = Channel PWM lines = Not Connected
+ *  Yellow Wires (2) = Channel PWM lines = connected through comparator to MUX
+ * 
+ *  Yellow Wires (2) = Timer LED lines = connected through comparator to MUX
  * 
  * Timer displays state via red and blue LEDs
  *  OFF = Manual
@@ -73,6 +76,7 @@
  * For ESP8266 Pinout, followed guide ~
  * https://randomnerdtutorials.com/esp8266-pinout-reference-gpios/
  *   Builtin LED for status
+ *   A0 MUX input summary state of LED controller
  *   D5 Control power button
  *   D6 Control dimmer button
  *   D7 Control timer button
@@ -80,6 +84,11 @@
  *   D1 Read dimmer button
  *   D2 Read timer button
  *   D3 for wifi-manager reset button (pulled high for our button)
+ *   D8 MUX control for summary input state state
+ * 
+ * Analog Input MUX:
+ *  D8 = LOW -> A0 is PWMing or Fully On
+ *  D8 = High -> A0 is Timer is not manual (bad state)
  * 
  * Tracking state transition:
  * ---
@@ -133,23 +142,29 @@
 //  Preprocessor Constants
 //==============================================================================
 
-#define CTRL_PWR_PIN                            (D5)
+#define CTRL_PWR_PIN                            (D0)
 #define CTRL_DIM_PIN                            (D6)
 #define CTRL_TIM_PIN                            (D7)
-#define READ_PWR_PIN                            (D0)
+#define READ_PWR_PIN                            (D5)
 #define READ_DIM_PIN                            (D1)
 #define READ_TIM_PIN                            (D2)
 #define RESET_BTN_PIN                           (D3)
 #define STATUS_LED_PIN                          (LED_BUILTIN)
+#define SUMMARY_MUX_CTRL_PIN                    (D8)
+#define SUMMARY_MUX_AIN_PIN                     (A0)
 
-#define RESET_BTN_TIME_THRESHOLD                (200L)
-#define PULSE_TIME                              (100L)
-#define COOLDOWN_THRESHOLD                      (500L)
+#define RESET_BTN_TIME_THRESHOLD                (200L)      //ms
+#define PULSE_TIME                              (100L)      //ms
+#define COOLDOWN_THRESHOLD                      (500L)      //ms
+#define MUX_SETTLE_TIME                         (1000L)     //us
+#define SETUP_HW_STABLE_DELAY                   (100L)      //ms
 
-#define DEBUG_SERIAL_BAUD                       (115200)
+#define DEBUG_SERIAL_BAUD                       (115200)    //baud
 
 #define NTP_URL                                 "pool.ntp.org"
 #define FALLBACK_AP_NAME                        "AP-ESP8266-Plant-Grow-Light"
+
+#define ANALOG_ON_THRESHOLD                     (512) // ADC is 2^10
 
 #define __NUM_POWER_STATES__                    (4)
 #define __NUM_DIMMER_STATES__                   (5)
@@ -166,17 +181,38 @@
 
 #define writeStatusLED(state)   (digitalWrite(STATUS_LED_PIN, (bool)(state)))
 
-#define _pulseBtn(pin) {                                                       \
-    Serial.println("Pulse " #pin);                                             \
-    digitalWrite(pin, HIGH);                                                   \
-    delay(PULSE_TIME);                                                         \
-    digitalWrite(pin, LOW);                                                    \
-    delay(1);                                                                  \
+#define _pulseBtn(pin, flag) {                                                  \
+    Serial.println("Pulse " #pin);                                              \
+    flag = true;                                                                \
+    digitalWrite(pin, HIGH);                                                    \
+    delay(PULSE_TIME);                                                          \
+    digitalWrite(pin, LOW);                                                     \
+    delay(1);                                                                   \
 }
 
-#define pulsePowerBtn()         (_pulseBtn(CTRL_PWR_PIN))
-#define pulseDimmerBtn()        (_pulseBtn(CTRL_DIM_PIN))
-#define pulseTimerBtn()         (_pulseBtn(CTRL_TIM_PIN))
+#define pulsePowerBtn()         (_pulseBtn(CTRL_PWR_PIN, _activePulse_power))
+#define pulseDimmerBtn()        (_pulseBtn(CTRL_DIM_PIN, _activePulse_dimmer))
+#define pulseTimerBtn()         (_pulseBtn(CTRL_TIM_PIN, _activePulse_timer))
+
+#define powerStateTransition(state) {                                           \
+    state.ch = (led_channel_t)(((int)state.ch + 1) % __NUM_POWER_STATES__);     \
+    if (state.ch == LED_OFF) {                                                  \
+        state.dim = LED_DIM_4;                                                  \
+        state.tim = LED_TIMER_OFF;                                              \
+    }                                                                           \
+}
+
+#define dimmerStateTransition(state) {                                          \
+    state.dim = (led_dimmer_t)(((int)state.dim + 1) % __NUM_DIMMER_STATES__);   \
+}
+
+#define timerStateTransition(state) {                                           \
+    state.tim = (led_timer_t)(((int)state.tim + 1) % __NUM_TIMER_STATES__);     \
+}
+
+#define warmUpADC() {for (int i=0; i<2; i++) {                                  \
+        analogRead(SUMMARY_MUX_AIN_PIN);                                        \
+}}
 
 //==============================================================================
 //  Enumerated Constants
@@ -242,35 +278,83 @@ static polip_workflow_t _polipWorkflow;
 
 static bool _blinkState = false;
 static unsigned long _blinkTime, _resetTime, _cooldownTime;
-static char _rxBuffer[50];
-static int _rxBufferIdx = 0;
 static bool _prevBtnState = false;
 static bool _flag_reset = false;
 static bool _hasActiveRPC = false;
 static bool _softTimerActive = false;
+static bool _homeOperationRequested = false;
 static char _activeRPCUUID[50];
 static led_state_t _currentState, _targetState;
 static soft_timer_t _softTimer;
+static bool _activePulse_power, _activePulse_dimmer, _activePulse_timer;
 
 //==============================================================================
 //  Private Function Prototypes
 //==============================================================================
 
-static unsigned long _blinkDurationByState();
+static void _homeLEDController(void);
+static bool readStateSummary_ledsOn(void);
+static bool readStateSummary_timerOn(void);
+static unsigned long _blinkDurationByState(void);
 static void _pushStateSetup(polip_device_t* dev, JsonDocument& doc);
 static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc);
 static void _pollRPCResponse(polip_device_t* dev, JsonDocument& doc);
 static void _pushRPCSetup(polip_device_t* dev, JsonDocument& doc);
 static void _pushRPCResponse(polip_device_t* dev, JsonDocument& doc);
 static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source);
+static void _debugSerialInterface(void);
+bool operator == (const led_state_t& lhs, const led_state_t& rhs);
+bool operator != (const led_state_t& lhs, const led_state_t& rhs);
+
+//==============================================================================
+//  ISRs
+//==============================================================================
+
+//NOTE: removing interrupts as it gets us into a weird feedback loop
+// Buttons are only for fixing state mis-match manually - does not push up state
+
+// ICACHE_RAM_ATTR void _isr_power_pinChange(void) {
+//     // Serial.println("PWR ISR");
+//     // if (_activePulse_power) { //ack
+//     //     _activePulse_power = false; 
+//     // } else {
+//     //     powerStateTransition(_currentState);
+//     //     _targetState.ch = _currentState.ch;
+//     //     _targetState.dim = _currentState.dim;
+//     //     POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+//     // }
+// }
+
+// ICACHE_RAM_ATTR void _isr_dimmer_pinChange(void) {
+//     // Serial.println("DIM ISR");
+//     // if (_activePulse_dimmer) { //ack
+//     //     _activePulse_dimmer = false; 
+//     // } else {
+//     //     dimmerStateTransition(_currentState);
+//     //     _targetState.dim = _currentState.dim;
+//     //     POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+//     // }
+// }
+
+// ICACHE_RAM_ATTR void _isr_timer_pinChange(void) {
+//     // Serial.println("TIM ISR");
+//     // if (_activePulse_timer) { //ack
+//     //     _activePulse_timer = false; 
+//     // } else {
+//     //     timerStateTransition(_currentState);
+//     //     _targetState.tim = _currentState.tim;
+//     // }
+// }
 
 //==============================================================================
 //  MAIN
 //==============================================================================
 
-void setup() {
+void setup(void) {
     Serial.begin(DEBUG_SERIAL_BAUD);
     Serial.flush();
+
+    Serial.println("Basic Hardware Setup");
 
     pinMode(CTRL_PWR_PIN, OUTPUT);
     pinMode(CTRL_DIM_PIN, OUTPUT);
@@ -280,16 +364,29 @@ void setup() {
     pinMode(READ_TIM_PIN, INPUT);
     pinMode(STATUS_LED_PIN, OUTPUT);
     pinMode(RESET_BTN_PIN, INPUT); 
+    pinMode(SUMMARY_MUX_CTRL_PIN, OUTPUT);
 
     digitalWrite(CTRL_PWR_PIN, LOW);
     digitalWrite(CTRL_DIM_PIN, LOW);
     digitalWrite(CTRL_TIM_PIN, LOW);
+    digitalWrite(SUMMARY_MUX_CTRL_PIN, LOW);
+
+    warmUpADC();
+
+    delay(SETUP_HW_STABLE_DELAY);
+
+    Serial.println("Jog Home");
+    _homeLEDController();
+
+    Serial.println("Wifi / Service Setup");
 
     _wifiManager.autoConnect(FALLBACK_AP_NAME);
 
     _timeClient.begin();
 
     POLIP_BLOCK_AWAIT_SERVER_OK();
+
+    Serial.println("Set Start State");
 
     _polipDevice.serialStr = SERIAL_STR;
     _polipDevice.keyStr = (const uint8_t*)KEY_STR;
@@ -299,20 +396,14 @@ void setup() {
     _polipDevice.skipTagCheck = false;
 
     _polipWorkflow.device = &_polipDevice;
-    _polipWorkflow.params.pollRPC = false;
+    _polipWorkflow.params.pollRPC = true;
     _polipWorkflow.hooks.pushStateSetupCb = _pushStateSetup;
     _polipWorkflow.hooks.pollStateRespCb = _pollStateResponse;
     _polipWorkflow.hooks.pollRPCRespCb = _pollRPCResponse;
     _polipWorkflow.hooks.workflowErrorCb = _errorHandler;
     _polipWorkflow.hooks.pushRPCSetupCb = _pushRPCSetup;
     _polipWorkflow.hooks.pushRPCRespCb = _pushRPCResponse;
-
-    unsigned long currentTime = millis();
-    polip_workflow_initialize(&_polipWorkflow, currentTime);
-    _cooldownTime = _blinkTime = _resetTime = currentTime;
-    _prevBtnState = readResetBtnState();
-    _flag_reset = false;
-
+    
     _currentState.ch = LED_OFF;
     _currentState.dim = LED_DIM_4;
     _currentState.tim = LED_TIMER_OFF;
@@ -320,9 +411,27 @@ void setup() {
     _targetState.ch = LED_OFF;
     _targetState.dim = LED_DIM_4;
     _targetState.tim = LED_TIMER_OFF;
+
+    unsigned long currentTime = millis();
+    polip_workflow_initialize(&_polipWorkflow, currentTime);
+    _cooldownTime = _blinkTime = _resetTime = currentTime;
+    _prevBtnState = readResetBtnState();
+    _flag_reset = false;
+    _softTimerActive = false;
+    _homeOperationRequested = false;
+    _hasActiveRPC = false;
+
+    // Serial.println("Enable Interrupts");
+
+    // attachInterrupt(digitalPinToInterrupt(READ_PWR_PIN), _isr_power_pinChange, RISING);
+    // attachInterrupt(digitalPinToInterrupt(READ_DIM_PIN), _isr_dimmer_pinChange, RISING);
+    // attachInterrupt(digitalPinToInterrupt(READ_TIM_PIN), _isr_timer_pinChange, RISING);
+
+    Serial.println("---");
 }
 
-void loop() {
+void loop(void) {
+    
     // We do most things against soft timers in the main loop
     unsigned long currentTime = millis();
 
@@ -336,83 +445,22 @@ void loop() {
         POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
     }
 
+    // Jog current controls back to home
+    if (_homeOperationRequested) { 
+        _homeOperationRequested = false;
+        _homeLEDController();
+    }
+
+    // Monitor hardware timer state in bad config
+    if (_targetState.tim != LED_TIMER_OFF) {
+        _targetState.tim = LED_TIMER_OFF;
+    }
+
     // Update Polip Server
     polip_workflow_periodic_update(&_polipWorkflow, _doc, _timeClient.getFormattedDate().c_str(), currentTime);
 
     // Serial debugging interface provides full state control
-    while (Serial.available() > 0) {
-        if (_rxBufferIdx >= (sizeof(_rxBuffer) - 1)) {
-            Serial.println(F("Error - Buffer Overflow ~ Clearing"));
-            _rxBufferIdx = 0;
-        }
-
-        char c = Serial.read();
-        if (c != '\n') {
-            _rxBuffer[_rxBufferIdx] = c;
-            _rxBufferIdx++;
-        } else {
-            _rxBuffer[_rxBufferIdx] = '\0';
-            _rxBufferIdx = 0;
-      
-            String str = String(_rxBuffer);
-      
-            if (str == "reset") {
-                Serial.println(F("Debug Reset Requested"));
-                _flag_reset = true;
-            } else if (str == "power?") { 
-                Serial.println(_currentState.ch);
-            } else if (str == "dim?") { 
-                Serial.println(_currentState.dim);
-            } else if (str == "timer?") { 
-                Serial.println(_targetState.tim);
-                Serial.println(_softTimerActive);
-                Serial.println(_softTimer.timestamp);
-                Serial.println(_softTimer.hours);
-            } else if (str == "pon") { 
-                _targetState.ch = LED_ALL;
-                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-            } else if (str == "poff") { 
-                _targetState.ch = LED_OFF;
-                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-            } else if (str == "pcha") { 
-                _targetState.ch = LED_CHA;
-                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-            } else if (str == "pchb") { 
-                _targetState.ch = LED_CHB;
-                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-            } else if (str == "dim0") { 
-                _targetState.dim = LED_DIM_0;
-                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-            } else if (str == "dim1") { 
-                _targetState.dim = LED_DIM_1;
-                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-            } else if (str == "dim2") { 
-                _targetState.dim = LED_DIM_2;
-                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-            } else if (str == "dim3") { 
-                _targetState.dim = LED_DIM_3;
-                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-            } else if (str == "dim4") { 
-                _targetState.dim = LED_DIM_4;
-                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-            } else if (str == "toff") { 
-                _targetState.tim = LED_TIMER_OFF;
-                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-            } else if (str == "error?") {
-                if (POLIP_WORKFLOW_IN_ERROR(&_polipWorkflow)) {
-                    Serial.println(F("Error in PolipLib: "));
-                    Serial.println((int)_polipWorkflow.flags.error);
-                } else {
-                    Serial.println(F("No Error"));
-                }
-                POLIP_WORKFLOW_ACK_ERROR(&_polipWorkflow);
-            } else {
-                Serial.print(F("Error - Invalid Command ~ `"));
-                Serial.print(str);
-                Serial.println(F("`"));
-            }
-        }
-    }
+    _debugSerialInterface();
 
     // Handle Reset button
     bool btnState = readResetBtnState();
@@ -439,14 +487,21 @@ void loop() {
     if ((currentTime - _cooldownTime) > COOLDOWN_THRESHOLD) {
         _cooldownTime = currentTime;
 
+        if (_targetState != _currentState) {
+            Serial.println("Target State, Current State");
+            Serial.print(_targetState.ch);  Serial.print("\t,\t"); Serial.println(_currentState.ch);
+            Serial.print(_targetState.dim); Serial.print("\t,\t"); Serial.println(_currentState.dim);
+            Serial.print(_targetState.tim); Serial.print("\t,\t"); Serial.println(_currentState.tim);
+        }
+
         if (_currentState.ch != _targetState.ch) {
-            _currentState.ch = (led_channel_t)(((int)_currentState.ch + 1) % __NUM_POWER_STATES__);
+            powerStateTransition(_currentState);
             pulsePowerBtn();
         } else if (_currentState.tim != _targetState.tim && _currentState.ch != LED_OFF) {
-            _currentState.tim = (led_timer_t)(((int)_currentState.tim + 1) % __NUM_TIMER_STATES__);
+            timerStateTransition(_currentState);
             pulseTimerBtn();
         } else if (_currentState.dim != _targetState.dim && _currentState.ch != LED_OFF) {
-            _currentState.dim = (led_dimmer_t)(((int)_currentState.dim + 1) % __NUM_DIMMER_STATES__);
+            dimmerStateTransition(_currentState);
             pulseDimmerBtn();
         }
     }
@@ -466,17 +521,60 @@ void loop() {
 //  Private Function Implementation
 //==============================================================================
 
-static unsigned long _blinkDurationByState() {
-    if (_currentState.ch == LED_OFF) {
+static void _homeLEDController(void) {
+    //jog hardware until yellow wires (actual output channels) are off - this will get us into good state
+    
+    Serial.println("Performing LED Control State Homing");
+
+    Serial.print("Power / Dimmer State");
+    while (readStateSummary_ledsOn()) {
+        pulsePowerBtn();
+        Serial.print('.');
+        delay(COOLDOWN_THRESHOLD);
+    }
+    _activePulse_power = false;
+    Serial.println(" OK");
+
+    Serial.print("Timer State");
+    while (readStateSummary_timerOn()) {
+        pulseTimerBtn();
+        Serial.print('.');
+        delay(COOLDOWN_THRESHOLD);
+    }
+    _activePulse_timer = false;
+    Serial.println(" OK");
+
+    _currentState.ch = LED_OFF;
+    _currentState.dim = LED_DIM_4;
+    _currentState.tim = LED_TIMER_OFF;
+}
+
+static bool readStateSummary_ledsOn(void) {
+    digitalWrite(SUMMARY_MUX_CTRL_PIN, HIGH);
+    delayMicroseconds(MUX_SETTLE_TIME);
+    return analogRead(SUMMARY_MUX_AIN_PIN) > ANALOG_ON_THRESHOLD;
+}
+
+static bool readStateSummary_timerOn(void) {
+    digitalWrite(SUMMARY_MUX_CTRL_PIN, LOW);
+    delayMicroseconds(MUX_SETTLE_TIME);
+    return analogRead(SUMMARY_MUX_AIN_PIN) > ANALOG_ON_THRESHOLD;
+}
+
+static unsigned long _blinkDurationByState(void) {
+    if (POLIP_WORKFLOW_IN_ERROR(&_polipWorkflow)) {
+        return 1L;
+    } else if (_currentState.ch == LED_OFF) {
         return 2000L; // Long pulse = off
     } else if (_currentState.tim != LED_TIMER_OFF) {
-        return 100L; // Very fast = error; timer should not be set
+        return 300L; // Very fast = error; timer should not be set
     } else {
         return 500L + 100L * _currentState.dim;
     }
 }
 
 static void _pushStateSetup(polip_device_t* dev, JsonDocument& doc) {
+    Serial.println("Pushing State");
     JsonObject stateObj = doc.createNestedObject("state");
     stateObj["power"] = (_targetState.ch == LED_OFF) ? "off" : "on";
     stateObj["intensity"] = _targetState.dim;
@@ -528,27 +626,26 @@ static void _pollRPCResponse(polip_device_t* dev, JsonDocument& doc) {
         JsonObject rpcObj = doc["rpc"];
         String uuid = rpcObj["uuid"]; 
         String type = rpcObj["type"];
+        JsonObject paramObj = rpcObj["parameters"];
 
         if (type == "timer") {
-            //parameters parse
-            bool paramsParsedSuccessfully = false;
-            JsonArray array = rpcObj["parameters"].as<JsonArray>();
-            for(JsonObject param : array) {
-                if (param.containsKey("duration")) {
-                    _softTimer.timestamp = _timeClient.getFormattedDate();
-                    _softTimer.hours = param["duration"];
-                    _softTimer._targetTime = 60 * 60 * _softTimer.hours + _timeClient.getEpochTime();
-                    paramsParsedSuccessfully = true;
-                }
-            }
-
-            if (paramsParsedSuccessfully) {
+            if (paramObj.containsKey("duration")) {
+                _softTimer.timestamp = _timeClient.getFormattedDate();
+                _softTimer.hours = paramObj["duration"];
+                _softTimer._targetTime = 60 * 60 * _softTimer.hours + _timeClient.getEpochTime();
                 _hasActiveRPC = true;
+                _softTimerActive = true;
                 strcpy(_activeRPCUUID, uuid.c_str());
                 POLIP_WORKFLOW_RPC_FINISHED(&_polipWorkflow);
             } else {
                 Serial.println("Failed to parse soft timer RPC");
             }
+        } else if (type == "home") {
+            // ignore params
+            _hasActiveRPC = true;
+            _homeOperationRequested = true;
+            strcpy(_activeRPCUUID, uuid.c_str());
+            POLIP_WORKFLOW_RPC_FINISHED(&_polipWorkflow);
         }
     }
 }
@@ -570,3 +667,96 @@ static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow
     Serial.print(F(" with CODE="));
     Serial.println((int)_polipWorkflow.flags.error);
 } 
+
+static void _debugSerialInterface(void) {
+    static char _rxBuffer[50];
+    static int _rxBufferIdx = 0;
+
+    while (Serial.available() > 0) {
+        if (_rxBufferIdx >= (sizeof(_rxBuffer) - 1)) {
+            Serial.println(F("Error - Buffer Overflow ~ Clearing"));
+            _rxBufferIdx = 0;
+        }
+
+        char c = Serial.read();
+        if (c != '\n') {
+            _rxBuffer[_rxBufferIdx] = c;
+            _rxBufferIdx++;
+        } else {
+            _rxBuffer[_rxBufferIdx] = '\0';
+            _rxBufferIdx = 0;
+      
+            String str = String(_rxBuffer);
+      
+            if (str == "reset") {
+                Serial.println(F("Debug Reset Requested"));
+                _flag_reset = true;
+            } else if (str == "power?") { 
+                Serial.println(_currentState.ch);
+            } else if (str == "dim?") { 
+                Serial.println(_currentState.dim);
+            } else if (str == "timer?") { 
+                Serial.print("HW TIM: ");
+                Serial.println(_currentState.tim);
+                Serial.print("SW TIM Active: ");
+                Serial.println(_softTimerActive);
+                Serial.print("SW TIM Timestamp: ");
+                Serial.println(_softTimer.timestamp);
+                Serial.print("SW TIM Hours: ");
+                Serial.println(_softTimer.hours);
+            } else if (str == "pon") { 
+                _targetState.ch = LED_ALL;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+            } else if (str == "poff") { 
+                _targetState.ch = LED_OFF;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+            } else if (str == "pcha") { 
+                _targetState.ch = LED_CHA;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+            } else if (str == "pchb") { 
+                _targetState.ch = LED_CHB;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+            } else if (str == "dim0") { 
+                _targetState.dim = LED_DIM_0;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+            } else if (str == "dim1") { 
+                _targetState.dim = LED_DIM_1;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+            } else if (str == "dim2") { 
+                _targetState.dim = LED_DIM_2;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+            } else if (str == "dim3") { 
+                _targetState.dim = LED_DIM_3;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+            } else if (str == "dim4") { 
+                _targetState.dim = LED_DIM_4;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+            } else if (str == "toff") { 
+                _targetState.tim = LED_TIMER_OFF;
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+            } else if (str == "home") {
+                _homeOperationRequested = true;
+            } else if (str == "error?") {
+                if (POLIP_WORKFLOW_IN_ERROR(&_polipWorkflow)) {
+                    Serial.println(F("Error in PolipLib: "));
+                    Serial.println((int)_polipWorkflow.flags.error);
+                } else {
+                    Serial.println(F("No Error"));
+                }
+                POLIP_WORKFLOW_ACK_ERROR(&_polipWorkflow);
+            } else {
+                Serial.print(F("Error - Invalid Command ~ `"));
+                Serial.print(str);
+                Serial.println(F("`"));
+            }
+        }
+    }
+}
+
+bool operator == (const led_state_t& lhs, const led_state_t& rhs) {
+    return (lhs.ch == rhs.ch) && (lhs.dim == rhs.dim) && (lhs.tim == rhs.tim);
+}
+
+bool operator != (const led_state_t& lhs, const led_state_t& rhs) {
+    return !(lhs == rhs);
+}
