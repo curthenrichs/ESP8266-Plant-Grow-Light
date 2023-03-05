@@ -305,6 +305,7 @@ static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow
 static void _debugSerialInterface(void);
 bool operator == (const led_state_t& lhs, const led_state_t& rhs);
 bool operator != (const led_state_t& lhs, const led_state_t& rhs);
+static void _postNotification(const char* str);
 
 //==============================================================================
 //  ISRs
@@ -443,22 +444,14 @@ void loop(void) {
         _targetState.ch = LED_OFF;
         _softTimerActive = false;
         POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-
-        _doc.clear();
-        _doc["message"] = "Timer RPC Completed";
-        _doc["code"] = 0; // Notification
-        polip_pushNotification(&_polipDevice, _doc, _timeClient.getFormattedDate().c_str());
+        _postNotification("Timer RPC Completed");
     }
 
     // Jog current controls back to home
     if (_homeOperationRequested) { 
         _homeOperationRequested = false;
         _homeLEDController();
-
-        _doc.clear();
-        _doc["message"] = "Home RPC Completed";
-        _doc["code"] = 0; // Notification
-        polip_pushNotification(&_polipDevice, _doc, _timeClient.getFormattedDate().c_str());
+        _postNotification("Home RPC Completed");
     }
 
     // Monitor hardware timer state in bad config
@@ -661,6 +654,15 @@ static void _pollRPCResponse(polip_device_t* dev, JsonDocument& doc) {
                 strcpy(_activeRPCUUID, uuid.c_str());
                 POLIP_WORKFLOW_RPC_FINISHED(&_polipWorkflow);
                 Serial.println("Started Home RPC");
+            } else if (type == "cancel") {
+                // ignore params
+                _hasActiveRPC = true;
+                _softTimerActive = false;
+                strcpy(_activeRPCUUID, uuid.c_str());
+                POLIP_WORKFLOW_RPC_FINISHED(&_polipWorkflow);
+                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+                Serial.println("Started Cancel RPC");
+                _postNotification("Cancel RPC Completed");
             }
 
             if (_hasActiveRPC) {
@@ -778,4 +780,11 @@ bool operator == (const led_state_t& lhs, const led_state_t& rhs) {
 
 bool operator != (const led_state_t& lhs, const led_state_t& rhs) {
     return !(lhs == rhs);
+}
+
+static void _postNotification(const char* str) {
+    _doc.clear();
+    _doc["message"] = str;
+    _doc["code"] = 0; // Notification
+    polip_pushNotification(&_polipDevice, _doc, _timeClient.getFormattedDate().c_str());
 }
