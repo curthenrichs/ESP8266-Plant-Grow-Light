@@ -443,12 +443,22 @@ void loop(void) {
         _targetState.ch = LED_OFF;
         _softTimerActive = false;
         POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+
+        _doc.clear();
+        _doc["message"] = "Timer RPC Completed";
+        _doc["code"] = 0; // Notification
+        polip_pushNotification(&_polipDevice, _doc, _timeClient.getFormattedDate().c_str());
     }
 
     // Jog current controls back to home
     if (_homeOperationRequested) { 
         _homeOperationRequested = false;
         _homeLEDController();
+
+        _doc.clear();
+        _doc["message"] = "Home RPC Completed";
+        _doc["code"] = 0; // Notification
+        polip_pushNotification(&_polipDevice, _doc, _timeClient.getFormattedDate().c_str());
     }
 
     // Monitor hardware timer state in bad config
@@ -588,7 +598,7 @@ static void _pushStateSetup(polip_device_t* dev, JsonDocument& doc) {
     }
     
     if (_softTimerActive) {
-        JsonObject timer = stateObj.createNestedObject("state");
+        JsonObject timer = stateObj.createNestedObject("timer");
         timer["timestamp"] = _softTimer.timestamp;
         timer["duration"] = _softTimer.hours;
     } else {
@@ -623,29 +633,39 @@ static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc) {
 
 static void _pollRPCResponse(polip_device_t* dev, JsonDocument& doc) {
     if (!_hasActiveRPC) { // Only accept RPC if not already working on one
-        JsonObject rpcObj = doc["rpc"];
-        String uuid = rpcObj["uuid"]; 
-        String type = rpcObj["type"];
-        JsonObject paramObj = rpcObj["parameters"];
 
-        if (type == "timer") {
-            if (paramObj.containsKey("duration")) {
-                _softTimer.timestamp = _timeClient.getFormattedDate();
-                _softTimer.hours = paramObj["duration"];
-                _softTimer._targetTime = 60 * 60 * _softTimer.hours + _timeClient.getEpochTime();
+        JsonArray array = doc["rpc"].as<JsonArray>();
+        for(JsonObject rpcObj : array) {
+            String uuid = rpcObj["uuid"]; 
+            String type = rpcObj["type"];
+            JsonObject paramObj = rpcObj["parameters"];
+
+            if (type == "timer") {
+                if (paramObj.containsKey("duration")) {
+                    _softTimer.timestamp = _timeClient.getFormattedDate();
+                    _softTimer.hours = paramObj["duration"];
+                    _softTimer._targetTime = 60 * 60 * _softTimer.hours + _timeClient.getEpochTime();
+                    _hasActiveRPC = true;
+                    _softTimerActive = true;
+                    strcpy(_activeRPCUUID, uuid.c_str());
+                    POLIP_WORKFLOW_RPC_FINISHED(&_polipWorkflow);
+                    POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+                    Serial.println("Started Timer RPC");
+                } else {
+                    Serial.println("Failed to parse soft timer RPC");
+                }
+            } else if (type == "home") {
+                // ignore params
                 _hasActiveRPC = true;
-                _softTimerActive = true;
+                _homeOperationRequested = true;
                 strcpy(_activeRPCUUID, uuid.c_str());
                 POLIP_WORKFLOW_RPC_FINISHED(&_polipWorkflow);
-            } else {
-                Serial.println("Failed to parse soft timer RPC");
+                Serial.println("Started Home RPC");
             }
-        } else if (type == "home") {
-            // ignore params
-            _hasActiveRPC = true;
-            _homeOperationRequested = true;
-            strcpy(_activeRPCUUID, uuid.c_str());
-            POLIP_WORKFLOW_RPC_FINISHED(&_polipWorkflow);
+
+            if (_hasActiveRPC) {
+                break; // Only one RPC can be processed in this system
+            }
         }
     }
 }
@@ -654,7 +674,6 @@ static void _pushRPCSetup(polip_device_t* dev, JsonDocument& doc) {
     JsonObject rpcObj = doc.createNestedObject("rpc");
     rpcObj["uuid"] = _activeRPCUUID;
     rpcObj["result"] = "OK";
-    
 }
 
 static void _pushRPCResponse(polip_device_t* dev, JsonDocument& doc) {
