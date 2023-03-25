@@ -143,8 +143,8 @@
 //==============================================================================
 
 #define CTRL_PWR_PIN                            (D0)
-#define CTRL_DIM_PIN                            (D6)
-#define CTRL_TIM_PIN                            (D7)
+#define CTRL_DIM_PIN                            (D7)
+#define CTRL_TIM_PIN                            (D6)
 #define READ_PWR_PIN                            (D5)
 #define READ_DIM_PIN                            (D1)
 #define READ_TIM_PIN                            (D2)
@@ -553,13 +553,13 @@ static void _homeLEDController(void) {
 }
 
 static bool readStateSummary_ledsOn(void) {
-    digitalWrite(SUMMARY_MUX_CTRL_PIN, HIGH);
+    digitalWrite(SUMMARY_MUX_CTRL_PIN, LOW);
     delayMicroseconds(MUX_SETTLE_TIME);
     return analogRead(SUMMARY_MUX_AIN_PIN) > ANALOG_ON_THRESHOLD;
 }
 
 static bool readStateSummary_timerOn(void) {
-    digitalWrite(SUMMARY_MUX_CTRL_PIN, LOW);
+    digitalWrite(SUMMARY_MUX_CTRL_PIN, HIGH);
     delayMicroseconds(MUX_SETTLE_TIME);
     return analogRead(SUMMARY_MUX_AIN_PIN) > ANALOG_ON_THRESHOLD;
 }
