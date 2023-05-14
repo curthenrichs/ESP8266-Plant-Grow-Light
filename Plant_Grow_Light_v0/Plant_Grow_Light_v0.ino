@@ -786,5 +786,6 @@ static void _postNotification(const char* str) {
     _doc.clear();
     _doc["message"] = str;
     _doc["code"] = 0; // Notification
+    _doc["userVisible"] = false; // Messages should not be directly read by humans
     polip_pushNotification(&_polipDevice, _doc, _timeClient.getFormattedDate().c_str());
 }
