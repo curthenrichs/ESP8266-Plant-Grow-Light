@@ -299,8 +299,8 @@ static unsigned long _blinkDurationByState(void);
 static void _pushStateSetup(polip_device_t* dev, JsonDocument& doc);
 static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc);
 static void _pollRPCResponse(polip_device_t* dev, JsonDocument& doc);
-static void _pushRPCSetup(polip_device_t* dev, JsonDocument& doc);
-static void _pushRPCResponse(polip_device_t* dev, JsonDocument& doc);
+static void _pushRPCAcknowledgeSetup(polip_device_t* dev, JsonDocument& doc);
+static void _pushRPCFinished(polip_device_t* dev, JsonDocument& doc, bool status, const char* timestamp);
 static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source);
 static void _debugSerialInterface(void);
 bool operator == (const led_state_t& lhs, const led_state_t& rhs);
@@ -402,8 +402,7 @@ void setup(void) {
     _polipWorkflow.hooks.pollStateRespCb = _pollStateResponse;
     _polipWorkflow.hooks.pollRPCRespCb = _pollRPCResponse;
     _polipWorkflow.hooks.workflowErrorCb = _errorHandler;
-    _polipWorkflow.hooks.pushRPCSetupCb = _pushRPCSetup;
-    _polipWorkflow.hooks.pushRPCRespCb = _pushRPCResponse;
+    _polipWorkflow.hooks.pushRPCSetupCb = _pushRPCAcknowledgeSetup;
     
     _currentState.ch = LED_OFF;
     _currentState.dim = LED_DIM_4;
@@ -444,6 +443,7 @@ void loop(void) {
         _targetState.ch = LED_OFF;
         _softTimerActive = false;
         POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+        _pushRPCFinished(&_polipDevice, _doc, true, _timeClient.getFormattedDate().c_str());
         _postNotification("Timer RPC Completed");
     }
 
@@ -451,6 +451,7 @@ void loop(void) {
     if (_homeOperationRequested) { 
         _homeOperationRequested = false;
         _homeLEDController();
+        _pushRPCFinished(&_polipDevice, _doc, true, _timeClient.getFormattedDate().c_str());
         _postNotification("Home RPC Completed");
     }
 
@@ -625,61 +626,92 @@ static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc) {
 }
 
 static void _pollRPCResponse(polip_device_t* dev, JsonDocument& doc) {
-    if (!_hasActiveRPC) { // Only accept RPC if not already working on one
 
-        JsonArray array = doc["rpc"].as<JsonArray>();
-        for(JsonObject rpcObj : array) {
-            String uuid = rpcObj["uuid"]; 
-            String type = rpcObj["type"];
-            JsonObject paramObj = rpcObj["parameters"];
+    JsonArray array = doc["rpc"].as<JsonArray>();
+    for(JsonObject rpcObj : array) {
+        String uuid = rpcObj["uuid"]; 
+        String type = rpcObj["type"];
+        String status = rpcObj["status"];
+        JsonObject paramObj = rpcObj["parameters"];
 
-            if (type == "timer") {
-                if (paramObj.containsKey("duration")) {
-                    _softTimer.timestamp = _timeClient.getFormattedDate();
-                    _softTimer.hours = paramObj["duration"];
-                    _softTimer._targetTime = 60 * 60 * _softTimer.hours + _timeClient.getEpochTime();
-                    _hasActiveRPC = true;
-                    _softTimerActive = true;
-                    strcpy(_activeRPCUUID, uuid.c_str());
-                    POLIP_WORKFLOW_RPC_FINISHED(&_polipWorkflow);
-                    POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-                    Serial.println("Started Timer RPC");
-                } else {
-                    Serial.println("Failed to parse soft timer RPC");
-                }
-            } else if (type == "home") {
-                // ignore params
-                _hasActiveRPC = true;
-                _homeOperationRequested = true;
-                strcpy(_activeRPCUUID, uuid.c_str());
-                POLIP_WORKFLOW_RPC_FINISHED(&_polipWorkflow);
-                Serial.println("Started Home RPC");
-            } else if (type == "cancel") {
-                // ignore params
-                _hasActiveRPC = true;
-                _softTimerActive = false;
-                strcpy(_activeRPCUUID, uuid.c_str());
-                POLIP_WORKFLOW_RPC_FINISHED(&_polipWorkflow);
-                POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-                Serial.println("Started Cancel RPC");
-                _postNotification("Cancel RPC Completed");
+        if (_hasActiveRPC) {
+            if (uuid == _activeRPCUUID) {
+                if (status == POLIP_RPC_STATUS_CANCELED) {
+                    if (type == "timer") {
+                        _softTimerActive = false;
+                        _postNotification("Timer RPC Canceled");
+                    } else if (type == "home") {
+                        _homeOperationRequested = false;
+                        _postNotification("Home RPC Canceled");
+                    }
+                    _hasActiveRPC = false;
+                } else if (status == POLIP_RPC_STATUS_PENDING) {
+                    POLIP_WORKFLOW_RPC_CHANGED(&_polipWorkflow); // will ack next cycle
+                } 
+                // else should be acknowledge state - of its anything else server error
+
+                // Found match, can end loop
+                //  If canceled, need to retry at start of list for next RPC, will wait for next poll
+                //  If pending, need to push ack (flag is set)
+                //  If acknowledged, already in good state nothing to do
+                break; 
             }
+        } else {
+            // grab first one pending
+            if (status == POLIP_RPC_STATUS_PENDING) {
+                if (type == "timer") {
+                    if (paramObj.containsKey("duration")) {
+                        _softTimer.timestamp = _timeClient.getFormattedDate();
+                        _softTimer.hours = paramObj["duration"];
+                        _softTimer._targetTime = 60 * 60 * _softTimer.hours + _timeClient.getEpochTime();
+                        _hasActiveRPC = true;
+                        _softTimerActive = true;
+                        strcpy(_activeRPCUUID, uuid.c_str());
+                        POLIP_WORKFLOW_RPC_CHANGED(&_polipWorkflow); // will ack next cycle
+                        POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+                        Serial.println("Started Timer RPC");
+                    } else {
+                        Serial.println("Failed to parse soft timer RPC");
+                    }
+                } else if (type == "home") {
+                    // ignore params
+                    _hasActiveRPC = true;
+                    _homeOperationRequested = true;
+                    strcpy(_activeRPCUUID, uuid.c_str());
+                    POLIP_WORKFLOW_RPC_CHANGED(&_polipWorkflow); // will ack next cycle
+                    Serial.println("Started Home RPC");
+                }
 
-            if (_hasActiveRPC) {
-                break; // Only one RPC can be processed in this system
+                if (_hasActiveRPC) {
+                    break; // Only one RPC can be processed in this system
+                }
             }
         }
     }
 }
 
-static void _pushRPCSetup(polip_device_t* dev, JsonDocument& doc) {
-    JsonObject rpcObj = doc.createNestedObject("rpc");
-    rpcObj["uuid"] = _activeRPCUUID;
-    rpcObj["result"] = "OK";
+static void _pushRPCAcknowledgeSetup(polip_device_t* dev, JsonDocument& doc) {
+    if (_hasActiveRPC) {
+        // Called from workflow
+        JsonObject rpcObj = doc.createNestedObject("rpc");
+        rpcObj["uuid"] = _activeRPCUUID;
+        rpcObj["result"] = nullptr;
+        rpcObj["status"] = "acknowledged";
+    }
 }
 
-static void _pushRPCResponse(polip_device_t* dev, JsonDocument& doc) {
-    _hasActiveRPC = false;
+static void _pushRPCFinished(polip_device_t* dev, JsonDocument& doc, bool status, const char* timestamp) {
+    if (_hasActiveRPC) {
+        // Called async
+        JsonObject rpcObj = doc.createNestedObject("rpc");
+        rpcObj["uuid"] = _activeRPCUUID;
+        rpcObj["result"] = nullptr;
+        rpcObj["status"] = (Status) ? "success" : "failure";
+
+        polip_pushRPC(dev, doc, timestamp);
+        _hasActiveRPC = false;
+        _polipWorkflow.flags.rpcChanged = false;
+    }
 }
 
 static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source) { 
