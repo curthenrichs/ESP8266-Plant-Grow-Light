@@ -275,15 +275,15 @@ static NTPClient _timeClient(_ntpUDP, NTP_URL, 0);
 static WiFiManager _wifiManager;
 static polip_device_t _polipDevice;
 static polip_workflow_t _polipWorkflow;
+static polip_rpc_workflow_t _polipRPCWorkflow;
 
 static bool _blinkState = false;
 static unsigned long _blinkTime, _resetTime, _cooldownTime;
 static bool _prevBtnState = false;
 static bool _flag_reset = false;
-static bool _hasActiveRPC = false;
 static bool _softTimerActive = false;
+static polip_rpc_t* _activeRPCPtr = NULL;
 static bool _homeOperationRequested = false;
-static char _activeRPCUUID[50];
 static led_state_t _currentState, _targetState;
 static soft_timer_t _softTimer;
 static bool _activePulse_power, _activePulse_dimmer, _activePulse_timer;
@@ -298,14 +298,14 @@ static bool readStateSummary_timerOn(void);
 static unsigned long _blinkDurationByState(void);
 static void _pushStateSetup(polip_device_t* dev, JsonDocument& doc);
 static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc);
-static void _pollRPCResponse(polip_device_t* dev, JsonDocument& doc);
-static void _pushRPCAcknowledgeSetup(polip_device_t* dev, JsonDocument& doc);
-static void _pushRPCFinished(polip_device_t* dev, JsonDocument& doc, bool status, const char* timestamp);
-static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source);
+static bool _acceptRPC(polip_device_t* dev, polip_rpc_t* rpc, JsonObject& parameters);
+static bool _cancelRPC(polip_device_t* dev, polip_rpc_t* rpc);
+static void _freeRPC(polip_device_t* dev, polip_rpc_t* rpc);
+static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source, polip_ret_code_t error);
 static void _debugSerialInterface(void);
 bool operator == (const led_state_t& lhs, const led_state_t& rhs);
 bool operator != (const led_state_t& lhs, const led_state_t& rhs);
-static void _postNotification(const char* str);
+static void _notificationSetup(polip_device_t* dev, polip_rpc_t* rpc, JsonDocument& doc);
 
 //==============================================================================
 //  ISRs
@@ -396,13 +396,17 @@ void setup(void) {
     _polipDevice.firmwareStr = FIRMWARE_STR;
     _polipDevice.skipTagCheck = false;
 
+    _polipRPCWorkflow.params.pushAdditionalNotification = true;
+    _polipRPCWorkflow.hooks.acceptRPC = _acceptRPC;
+    _polipRPCWorkflow.hooks.cancelRPC = _cancelRPC;
+    _polipRPCWorkflow.hooks.freeRPC = _freeRPC;
+    _polipRPCWorkflow.hooks.pushNotifactionSetup = _notificationSetup;
+
     _polipWorkflow.device = &_polipDevice;
-    _polipWorkflow.params.pollRPC = true;
+    _polipWorkflow.rpcWorkflow = &_polipRPCWorkflow;
     _polipWorkflow.hooks.pushStateSetupCb = _pushStateSetup;
     _polipWorkflow.hooks.pollStateRespCb = _pollStateResponse;
-    _polipWorkflow.hooks.pollRPCRespCb = _pollRPCResponse;
     _polipWorkflow.hooks.workflowErrorCb = _errorHandler;
-    _polipWorkflow.hooks.pushRPCSetupCb = _pushRPCAcknowledgeSetup;
     
     _currentState.ch = LED_OFF;
     _currentState.dim = LED_DIM_4;
@@ -419,7 +423,7 @@ void setup(void) {
     _flag_reset = false;
     _softTimerActive = false;
     _homeOperationRequested = false;
-    _hasActiveRPC = false;
+    _activeRPCPtr = NULL;
 
     // Serial.println("Enable Interrupts");
 
@@ -443,16 +447,15 @@ void loop(void) {
         _targetState.ch = LED_OFF;
         _softTimerActive = false;
         POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-        _pushRPCFinished(&_polipDevice, _doc, true, _timeClient.getFormattedDate().c_str());
-        _postNotification("Timer RPC Completed");
+        POLIP_RPC_WORKFLOW_RPC_SUCCEEDED(&_polipRPCWorkflow, _activeRPCPtr);
     }
 
     // Jog current controls back to home
     if (_homeOperationRequested) { 
         _homeOperationRequested = false;
         _homeLEDController();
-        _pushRPCFinished(&_polipDevice, _doc, true, _timeClient.getFormattedDate().c_str());
-        _postNotification("Home RPC Completed");
+        POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
+        POLIP_RPC_WORKFLOW_RPC_SUCCEEDED(&_polipRPCWorkflow, _activeRPCPtr);
     }
 
     // Monitor hardware timer state in bad config
@@ -625,100 +628,11 @@ static void _pollStateResponse(polip_device_t* dev, JsonDocument& doc) {
     // Note ignore timer (must be set via RPC)
 }
 
-static void _pollRPCResponse(polip_device_t* dev, JsonDocument& doc) {
-
-    JsonArray array = doc["rpc"].as<JsonArray>();
-    for(JsonObject rpcObj : array) {
-        String uuid = rpcObj["uuid"]; 
-        String type = rpcObj["type"];
-        String status = rpcObj["status"];
-        JsonObject paramObj = rpcObj["parameters"];
-
-        if (_hasActiveRPC) {
-            if (uuid == _activeRPCUUID) {
-                if (status == POLIP_RPC_STATUS_CANCELED) {
-                    if (type == "timer") {
-                        _softTimerActive = false;
-                        _postNotification("Timer RPC Canceled");
-                    } else if (type == "home") {
-                        _homeOperationRequested = false;
-                        _postNotification("Home RPC Canceled");
-                    }
-                    _hasActiveRPC = false;
-                } else if (status == POLIP_RPC_STATUS_PENDING) {
-                    POLIP_WORKFLOW_RPC_CHANGED(&_polipWorkflow); // will ack next cycle
-                } 
-                // else should be acknowledge state - of its anything else server error
-
-                // Found match, can end loop
-                //  If canceled, need to retry at start of list for next RPC, will wait for next poll
-                //  If pending, need to push ack (flag is set)
-                //  If acknowledged, already in good state nothing to do
-                break; 
-            }
-        } else {
-            // grab first one pending
-            if (status == POLIP_RPC_STATUS_PENDING) {
-                if (type == "timer") {
-                    if (paramObj.containsKey("duration")) {
-                        _softTimer.timestamp = _timeClient.getFormattedDate();
-                        _softTimer.hours = paramObj["duration"];
-                        _softTimer._targetTime = 60 * 60 * _softTimer.hours + _timeClient.getEpochTime();
-                        _hasActiveRPC = true;
-                        _softTimerActive = true;
-                        strcpy(_activeRPCUUID, uuid.c_str());
-                        POLIP_WORKFLOW_RPC_CHANGED(&_polipWorkflow); // will ack next cycle
-                        POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow);
-                        Serial.println("Started Timer RPC");
-                    } else {
-                        Serial.println("Failed to parse soft timer RPC");
-                    }
-                } else if (type == "home") {
-                    // ignore params
-                    _hasActiveRPC = true;
-                    _homeOperationRequested = true;
-                    strcpy(_activeRPCUUID, uuid.c_str());
-                    POLIP_WORKFLOW_RPC_CHANGED(&_polipWorkflow); // will ack next cycle
-                    Serial.println("Started Home RPC");
-                }
-
-                if (_hasActiveRPC) {
-                    break; // Only one RPC can be processed in this system
-                }
-            }
-        }
-    }
-}
-
-static void _pushRPCAcknowledgeSetup(polip_device_t* dev, JsonDocument& doc) {
-    if (_hasActiveRPC) {
-        // Called from workflow
-        JsonObject rpcObj = doc.createNestedObject("rpc");
-        rpcObj["uuid"] = _activeRPCUUID;
-        rpcObj["result"] = nullptr;
-        rpcObj["status"] = "acknowledged";
-    }
-}
-
-static void _pushRPCFinished(polip_device_t* dev, JsonDocument& doc, bool status, const char* timestamp) {
-    if (_hasActiveRPC) {
-        // Called async
-        JsonObject rpcObj = doc.createNestedObject("rpc");
-        rpcObj["uuid"] = _activeRPCUUID;
-        rpcObj["result"] = nullptr;
-        rpcObj["status"] = (Status) ? "success" : "failure";
-
-        polip_pushRPC(dev, doc, timestamp);
-        _hasActiveRPC = false;
-        _polipWorkflow.flags.rpcChanged = false;
-    }
-}
-
-static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source) { 
+static void _errorHandler(polip_device_t* dev, JsonDocument& doc, polip_workflow_source_t source, polip_ret_code_t error) { 
     Serial.print(F("Error Handler ~ polip server error during OP="));
     Serial.print((int)source);
     Serial.print(F(" with CODE="));
-    Serial.println((int)_polipWorkflow.flags.error);
+    Serial.println((int)error);
 } 
 
 static void _debugSerialInterface(void) {
@@ -814,10 +728,58 @@ bool operator != (const led_state_t& lhs, const led_state_t& rhs) {
     return !(lhs == rhs);
 }
 
-static void _postNotification(const char* str) {
-    _doc.clear();
-    _doc["message"] = str;
-    _doc["code"] = 0; // Notification
-    _doc["userVisible"] = false; // Messages should not be directly read by humans
-    polip_pushNotification(&_polipDevice, _doc, _timeClient.getFormattedDate().c_str());
+static void _notificationSetup(polip_device_t* dev, polip_rpc_t* rpc, JsonDocument& doc) {
+    doc["message"] = "RPC status updated";
+    doc["code"] = 0; // Notification
+    doc["userVisible"] = false; // Messages should not be directly read by humans
+}
+
+static bool _acceptRPC(polip_device_t* dev, polip_rpc_t* rpc, JsonObject& parameters) {
+
+    bool status = true;
+
+    if ((0 == strcmp(rpc->type, "timer"))) {
+        if (parameters.containsKey("duration")) {
+            _softTimer.timestamp = _timeClient.getFormattedDate();
+            _softTimer.hours = parameters["duration"];
+            _softTimer._targetTime = 60 * 60 * _softTimer.hours + _timeClient.getEpochTime();
+            _softTimerActive = true;
+            _activeRPCPtr = rpc;
+
+            POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow); // will push state next cycle
+            Serial.println("Started Timer RPC");
+
+        } else {
+            Serial.println("Failed to parse timer RPC");
+            status = false;
+        }
+    } else if (0 == strcmp(rpc->type, "home")) {
+            // ignore params
+            _homeOperationRequested = true;
+            Serial.println("Started Home RPC");
+    }
+
+    return status;
+}
+
+static bool _cancelRPC(polip_device_t* dev, polip_rpc_t* rpc) {
+
+    bool retStatus = true;
+
+    if (0 == strcmp(rpc->type, "timer")) {
+        _softTimerActive = false;
+        POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow); // will push state next cycle
+
+    } else if (0 == strcmp(rpc->type, "home")) {
+        retStatus = false; // Reject cancellations - once home operation starts, it will finish
+        POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow); // will push state next cycle
+    }
+
+    return retStatus;
+}
+
+static void _freeRPC(polip_device_t* dev, polip_rpc_t* rpc) {
+    _activeRPCPtr = NULL;
+    _softTimerActive = false;
+    _homeOperationRequested = false;
 }
