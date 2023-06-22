@@ -252,7 +252,7 @@ typedef struct _led_state {
 
 typedef struct _soft_timer {
     String timestamp;
-    int hours;
+    float hours;
     unsigned long _targetTime; // use getEpochTime()
 } soft_timer_t;
 
@@ -282,6 +282,7 @@ static unsigned long _blinkTime, _resetTime, _cooldownTime;
 static bool _prevBtnState = false;
 static bool _flag_reset = false;
 static bool _softTimerActive = false;
+static bool _saveHomeJogState = false;
 static polip_rpc_t* _activeRPCPtr = NULL;
 static bool _homeOperationRequested = false;
 static led_state_t _currentState, _targetState;
@@ -423,6 +424,7 @@ void setup(void) {
     _flag_reset = false;
     _softTimerActive = false;
     _homeOperationRequested = false;
+    _saveHomeJogState = false;
     _activeRPCPtr = NULL;
 
     // Serial.println("Enable Interrupts");
@@ -554,6 +556,12 @@ static void _homeLEDController(void) {
     _currentState.ch = LED_OFF;
     _currentState.dim = LED_DIM_4;
     _currentState.tim = LED_TIMER_OFF;
+
+    if (_saveHomeJogState) {
+        _targetState.ch = _currentState.ch;
+        _targetState.dim = _currentState.dim;
+        _targetState.tim = _currentState.tim;
+    }
 }
 
 static bool readStateSummary_ledsOn(void) {
@@ -754,9 +762,15 @@ static bool _acceptRPC(polip_device_t* dev, polip_rpc_t* rpc, JsonObject& parame
             status = false;
         }
     } else if (0 == strcmp(rpc->type, "home")) {
-            // ignore params
-            _homeOperationRequested = true;
-            Serial.println("Started Home RPC");
+        if (parameters.containsKey("save")) {
+            _saveHomeJogState = parameters["save"];
+        } else {
+            _saveHomeJogState = false; // If save isn't provided, assume not desired
+        }
+            
+        _homeOperationRequested = true;
+        _activeRPCPtr = rpc;
+        Serial.println("Started Home RPC");
     }
 
     return status;
@@ -768,10 +782,12 @@ static bool _cancelRPC(polip_device_t* dev, polip_rpc_t* rpc) {
 
     if (0 == strcmp(rpc->type, "timer")) {
         _softTimerActive = false;
+        _activeRPCPtr = rpc;
         POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow); // will push state next cycle
 
     } else if (0 == strcmp(rpc->type, "home")) {
         retStatus = false; // Reject cancellations - once home operation starts, it will finish
+        _activeRPCPtr = rpc;
         POLIP_WORKFLOW_STATE_CHANGED(&_polipWorkflow); // will push state next cycle
     }
 
