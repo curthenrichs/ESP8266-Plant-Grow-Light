@@ -396,6 +396,7 @@ void setup(void) {
     _polipDevice.hardwareStr = HARDWARE_STR;
     _polipDevice.firmwareStr = FIRMWARE_STR;
     _polipDevice.skipTagCheck = false;
+    _polipDevice.debugMode = true;
 
     _polipRPCWorkflow.params.pushAdditionalNotification = true;
     _polipRPCWorkflow.hooks.acceptRPC = _acceptRPC;
@@ -404,7 +405,7 @@ void setup(void) {
     _polipRPCWorkflow.hooks.pushNotifactionSetup = _notificationSetup;
 
     _polipWorkflow.device = &_polipDevice;
-    _polipWorkflow.rpcWorkflow = &_polipRPCWorkflow;
+    _polipWorkflow.rpcWorkflow = &_polipRPCWorkflow;                        //TODO this was breaking comms - investigate
     _polipWorkflow.hooks.pushStateSetupCb = _pushStateSetup;
     _polipWorkflow.hooks.pollStateRespCb = _pollStateResponse;
     _polipWorkflow.hooks.workflowErrorCb = _errorHandler;
