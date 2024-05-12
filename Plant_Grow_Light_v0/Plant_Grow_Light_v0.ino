@@ -292,7 +292,7 @@ static led_state_t _currentState, _targetState;
 static soft_timer_t _softTimer;
 static bool _activePulse_power, _activePulse_dimmer, _activePulse_timer;
 
-static char _TRANSMISSION_BUFFER[POLIP_MIN_ARBITRARY_MSG_BUFFER_SIZE * 2];
+static char _transmissionBuffer[POLIP_MIN_ARBITRARY_MSG_BUFFER_SIZE * 2];
 
 //==============================================================================
 //  Private Function Prototypes
@@ -402,8 +402,8 @@ void setup(void) {
     _polipDevice.firmwareStr = FIRMWARE_STR;
     _polipDevice.skipTagCheck = false;
     _polipDevice.debugMode = true;
-    _polipDevice.buffer = _TRANSMISSION_BUFFER;
-    _polipDevice.bufferLen = sizeof(_TRANSMISSION_BUFFER);
+    _polipDevice.buffer = _transmissionBuffer;
+    _polipDevice.bufferLen = sizeof(_transmissionBuffer);
 
     _polipRPCWorkflow.params.pushAdditionalNotification = true;
     _polipRPCWorkflow.hooks.acceptRPC = _acceptRPC;
