@@ -123,6 +123,9 @@
  *                               ---------------------------------
  * 
  *  (When Power != off -> off) -> DON'T CARE
+ * 
+ * ----
+ * Seems the standard size for Okos Polip RX buffer is too small. 
  */
 
 //==============================================================================
@@ -269,7 +272,7 @@ const char* FIRMWARE_STR = POLIP_VERSION_STD_FORMAT(0,0,1);
 //  Private Module Variables
 //==============================================================================
 
-static StaticJsonDocument<POLIP_MIN_RECOMMENDED_DOC_SIZE> _doc;
+static StaticJsonDocument<(POLIP_MIN_RECOMMENDED_DOC_SIZE * 2)> _doc;
 static WiFiUDP _ntpUDP;
 static NTPClient _timeClient(_ntpUDP, NTP_URL, 0);
 static WiFiManager _wifiManager;
@@ -288,6 +291,8 @@ static bool _homeOperationRequested = false;
 static led_state_t _currentState, _targetState;
 static soft_timer_t _softTimer;
 static bool _activePulse_power, _activePulse_dimmer, _activePulse_timer;
+
+static char _TRANSMISSION_BUFFER[POLIP_MIN_ARBITRARY_MSG_BUFFER_SIZE * 2];
 
 //==============================================================================
 //  Private Function Prototypes
@@ -397,6 +402,8 @@ void setup(void) {
     _polipDevice.firmwareStr = FIRMWARE_STR;
     _polipDevice.skipTagCheck = false;
     _polipDevice.debugMode = true;
+    _polipDevice.buffer = _TRANSMISSION_BUFFER;
+    _polipDevice.bufferLen = sizeof(_TRANSMISSION_BUFFER);
 
     _polipRPCWorkflow.params.pushAdditionalNotification = true;
     _polipRPCWorkflow.hooks.acceptRPC = _acceptRPC;
